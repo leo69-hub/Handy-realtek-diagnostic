@@ -1,0 +1,10 @@
+{
+  "productName": "Handy Realtek Diagnostic",
+  "identifier": "com.pais.handy.realtek-diagnostic",
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "windows": {
+      "signCommand": null
+    }
+  }
+}
