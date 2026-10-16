@@ -20,6 +20,10 @@ use crate::audio_toolkit::{
     VoiceActivityDetector,
 };
 
+#[cfg(any(target_os = "windows", test))]
+#[path = "input_config.rs"]
+mod input_config;
+
 enum Cmd {
     /// Begin capturing. Carries the send timestamp so the consumer can log how
     /// long the command sat in the channel, plus a one-shot first-sample acknowledgement.
@@ -100,6 +104,7 @@ pub struct AudioRecorder {
     /// mode. Keyed by name so a system-default change misses naturally;
     /// cleared whenever an open fails so a stale rate/format self-heals on the
     /// caller's retry.
+    /// Windows diagnostics bypass cache reads to show the full candidate list.
     config_cache: Arc<Mutex<Option<(String, cpal::SupportedStreamConfig)>>>,
     /// Set by cpal when the active input stream can no longer capture.
     stream_error: Arc<AtomicBool>,
@@ -206,113 +211,149 @@ impl AudioRecorder {
             let init_result = (|| -> Result<(cpal::Stream, u32, Consumer<f32>), String> {
                 let config_started = Instant::now();
                 let device_name = thread_device.name().unwrap_or_default();
+                #[cfg(not(target_os = "windows"))]
                 let cached_config = config_cache
                     .lock()
                     .unwrap()
                     .as_ref()
                     .filter(|(name, _)| !device_name.is_empty() && *name == device_name)
                     .map(|(_, cfg)| cfg.clone());
+                #[cfg(target_os = "windows")]
+                let cached_config: Option<cpal::SupportedStreamConfig> = None;
                 let config_was_cached = cached_config.is_some();
-                let config = match cached_config {
+                #[cfg(target_os = "windows")]
+                let configs = input_config::device_candidates(&thread_device)?;
+                #[cfg(not(target_os = "windows"))]
+                let configs = vec![match cached_config {
                     Some(cfg) => cfg,
                     None => AudioRecorder::get_preferred_config(&thread_device)
                         .map_err(|e| format!("Failed to fetch preferred config: {e}"))?,
-                };
+                }];
                 let config_elapsed = config_started.elapsed();
+                let mut errors = Vec::new();
+                for (index, config) in configs.into_iter().enumerate() {
+                    stream_error.store(false, Ordering::Release);
+                    let attempt = (|| -> Result<_, String> {
+                        log::info!("Microphone config attempt {}: {:?}", index + 1, config);
+                        let sample_rate = config.sample_rate().0;
+                        let channels = config.channels() as usize;
 
-                let sample_rate = config.sample_rate().0;
-                let channels = config.channels() as usize;
-
-                log::info!(
-                    "Using device: {:?}\nSample rate: {}\nChannels: {}\nFormat: {:?}",
-                    thread_device.name(),
-                    sample_rate,
-                    channels,
-                    config.sample_format()
-                );
-
-                if let Some(channel) = selected_channel {
-                    if channel < channels {
-                        log::info!("Using selected input channel: {}", channel + 1);
-                    } else {
-                        log::warn!(
-                            "Selected input channel {} is out of range for a {}-channel device; averaging all channels instead",
-                            channel + 1,
-                            channels
+                        log::info!(
+                            "Using device: {:?}\nSample rate: {}\nChannels: {}\nFormat: {:?}",
+                            thread_device.name(),
+                            sample_rate,
+                            channels,
+                            config.sample_format()
                         );
+
+                        if let Some(channel) = selected_channel {
+                            if channel < channels {
+                                log::info!("Using selected input channel: {}", channel + 1);
+                            } else {
+                                log::warn!(
+                                    "Selected input channel {} is out of range for a {}-channel device; averaging all channels instead",
+                                    channel + 1,
+                                    channels
+                                );
+                            }
+                        } else {
+                            log::info!("Averaging all {} input channels", channels);
+                        }
+
+                        let build_started = Instant::now();
+                        let (stream, sample_consumer) = match config.sample_format() {
+                            cpal::SampleFormat::U8 => AudioRecorder::build_stream::<u8>(
+                                &thread_device,
+                                &config,
+                                channels,
+                                selected_channel,
+                                Arc::clone(&transport),
+                                Arc::clone(&stream_error),
+                            ),
+                            cpal::SampleFormat::I8 => AudioRecorder::build_stream::<i8>(
+                                &thread_device,
+                                &config,
+                                channels,
+                                selected_channel,
+                                Arc::clone(&transport),
+                                Arc::clone(&stream_error),
+                            ),
+                            cpal::SampleFormat::I16 => AudioRecorder::build_stream::<i16>(
+                                &thread_device,
+                                &config,
+                                channels,
+                                selected_channel,
+                                Arc::clone(&transport),
+                                Arc::clone(&stream_error),
+                            ),
+                            cpal::SampleFormat::I32 => AudioRecorder::build_stream::<i32>(
+                                &thread_device,
+                                &config,
+                                channels,
+                                selected_channel,
+                                Arc::clone(&transport),
+                                Arc::clone(&stream_error),
+                            ),
+                            cpal::SampleFormat::F32 => AudioRecorder::build_stream::<f32>(
+                                &thread_device,
+                                &config,
+                                channels,
+                                selected_channel,
+                                Arc::clone(&transport),
+                                Arc::clone(&stream_error),
+                            ),
+                            sample_format => {
+                                return Err(format!("Unsupported sample format: {sample_format:?}"));
+                            }
+                        }
+                        .map_err(|e| format!("Failed to build input stream: {e}"))?;
+                        let build_elapsed = build_started.elapsed();
+
+                        let play_started = Instant::now();
+                        stream
+                            .play()
+                            .map_err(|e| format!("Failed to start microphone stream: {e}"))?;
+                        log::debug!(
+                            "mic worker init: fetch_config={:?} (cached={}) build_stream={:?} play={:?}",
+                            config_elapsed,
+                            config_was_cached,
+                            build_elapsed,
+                            play_started.elapsed()
+                        );
+
+                        Ok((stream, sample_rate, sample_consumer))
+                    })();
+                    match attempt {
+                        Ok(result) => {
+                            log::info!(
+                                "Microphone config attempt {} succeeded: {:?}",
+                                index + 1,
+                                config
+                            );
+                            if !device_name.is_empty() {
+                                *config_cache.lock().unwrap() = Some((device_name, config));
+                            }
+                            return Ok(result);
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "Microphone config attempt {} failed: {:?}: {}",
+                                index + 1,
+                                config,
+                                error
+                            );
+                            let denied = is_microphone_access_denied(&error);
+                            errors.push(error);
+                            if denied {
+                                break;
+                            }
+                        }
                     }
-                } else {
-                    log::info!("Averaging all {} input channels", channels);
                 }
-
-                let build_started = Instant::now();
-                let (stream, sample_consumer) = match config.sample_format() {
-                    cpal::SampleFormat::U8 => AudioRecorder::build_stream::<u8>(
-                        &thread_device,
-                        &config,
-                        channels,
-                        selected_channel,
-                        Arc::clone(&transport),
-                        Arc::clone(&stream_error),
-                    ),
-                    cpal::SampleFormat::I8 => AudioRecorder::build_stream::<i8>(
-                        &thread_device,
-                        &config,
-                        channels,
-                        selected_channel,
-                        Arc::clone(&transport),
-                        Arc::clone(&stream_error),
-                    ),
-                    cpal::SampleFormat::I16 => AudioRecorder::build_stream::<i16>(
-                        &thread_device,
-                        &config,
-                        channels,
-                        selected_channel,
-                        Arc::clone(&transport),
-                        Arc::clone(&stream_error),
-                    ),
-                    cpal::SampleFormat::I32 => AudioRecorder::build_stream::<i32>(
-                        &thread_device,
-                        &config,
-                        channels,
-                        selected_channel,
-                        Arc::clone(&transport),
-                        Arc::clone(&stream_error),
-                    ),
-                    cpal::SampleFormat::F32 => AudioRecorder::build_stream::<f32>(
-                        &thread_device,
-                        &config,
-                        channels,
-                        selected_channel,
-                        Arc::clone(&transport),
-                        Arc::clone(&stream_error),
-                    ),
-                    sample_format => {
-                        return Err(format!("Unsupported sample format: {sample_format:?}"));
-                    }
-                }
-                .map_err(|e| format!("Failed to build input stream: {e}"))?;
-                let build_elapsed = build_started.elapsed();
-
-                let play_started = Instant::now();
-                stream
-                    .play()
-                    .map_err(|e| format!("Failed to start microphone stream: {e}"))?;
-                log::debug!(
-                    "mic worker init: fetch_config={:?} (cached={}) build_stream={:?} play={:?}",
-                    config_elapsed,
-                    config_was_cached,
-                    build_elapsed,
-                    play_started.elapsed()
-                );
-
-                // The device accepted this config; remember it so the next
-                // open skips the HAL property queries entirely.
-                if !config_was_cached && !device_name.is_empty() {
-                    *config_cache.lock().unwrap() = Some((device_name, config));
-                }
-
-                Ok((stream, sample_rate, sample_consumer))
+                Err(format!(
+                    "All microphone config attempts failed: {}",
+                    errors.join(" | ")
+                ))
             })();
 
             match init_result {
